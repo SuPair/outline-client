@@ -182,7 +182,8 @@ class OutlineVpn: NSObject {
   private func stopVpn() {
     let session: NETunnelProviderSession = tunnelManager?.connection as! NETunnelProviderSession
     session.stopTunnel()
-    setConnectVpnOnDemand(false) // Disable on demand so the VPN does not connect automatically.
+    // TODO: uncomment the next line to enable the auto-connect feature.
+    // setConnectVpnOnDemand(false) // Disable on demand so the VPN does not connect automatically.
     self.activeConnectionId = nil
   }
 
@@ -370,7 +371,8 @@ class OutlineVpn: NSObject {
        let connectionId = response[MessageKey.connectionId] as? String {
       self.activeConnectionId = connectionId
       // Enable on demand to connect automatically on boot if the VPN was connected on shutdown
-      self.setConnectVpnOnDemand(true)
+      // TODO: uncomment the next line to enable the auto-connect feature.
+      // self.setConnectVpnOnDemand(true)
     }
     completion(ErrorCode(rawValue: rawErrorCode) ?? ErrorCode.noError)
   }
