@@ -13,8 +13,6 @@
 // limitations under the License.
 
 import {ChildProcess, exec, execFile, execFileSync} from 'child_process';
-import * as http from 'http';
-import * as httpproxytosocks from 'http-proxy-to-socks/lib/proxy_server';
 import * as net from 'net';
 import * as path from 'path';
 import * as process from 'process';
@@ -35,15 +33,21 @@ function pathToEmbeddedExe(basename: string) {
 
 // Three tools are required to launch the proxy on Windows:
 //  - ss-local.exe connects with the remote Shadowsocks server, exposing a SOCKS5 proxy.
-//  - http-proxy-to-socks fronts the SOCKS5 proxy with a HTTP proxy (Windows cannot connect to a
-//  SOCKS5 server directly).
-//  - setsystemproxy.exe configures the system to use the HTTP proxy.
+//  - tun2socks for xxx
+//  - setsystemproxy.exe configures the system to route via tun2socks
 
 let ssLocal: ChildProcess|undefined;
-let httpProxy: http.Server|undefined;
+let tun2socks: ChildProcess|undefined;
 
 const PROXY_IP = '127.0.0.1';
 const SS_LOCAL_PORT = 1081;
+
+// TODO: read these from the system!
+const TUN2SOCKS_TUN_DEVICE_NAME = 'tun0';
+const TUN2SOCKS_TUN_DEVICE_IP = '192.168.1.5';
+const TUN2SOCKS_VIRTUAL_ROUTER_IP = '192.168.1.10';
+const TUN2SOCKS_TUN_DEVICE_NETWORK = '192.168.1.0';
+const TUN2SOCKS_VIRTUAL_ROUTER_NETMASK = '255.255.255.0';
 
 const CREDENTIALS_TEST_DOMAINS = ['example.com', 'ietf.org', 'wikipedia.org'];
 const REACHABILITY_TEST_TIMEOUT_MS = 10000;
@@ -79,13 +83,13 @@ export function launchProxy(
         throw errors.ErrorCode.INVALID_SERVER_CREDENTIALS;
       })
       .then(() => {
-        return startHttpProxy();
+        return startTun2socks(onDisconnected);
       })
       .catch((e) => {
         throw errors.ErrorCode.HTTP_PROXY_START_FAILURE;
       })
       .then((port) => {
-        configureSystemProxy(port);
+        configureSystemProxy(TUN2SOCKS_VIRTUAL_ROUTER_IP, config.host || '');
       })
       .catch((e) => {
         throw errors.ErrorCode.CONFIGURE_SYSTEM_PROXY_FAILURE;
@@ -94,7 +98,8 @@ export function launchProxy(
 
 // Resolves with true iff a TCP connection can be established with the Shadowsocks server.
 //
-// This has the same function as ShadowsocksConnectivity.isServerReachable in cordova-plugin-outline.
+// This has the same function as ShadowsocksConnectivity.isServerReachable in
+// cordova-plugin-outline.
 export function isServerReachable(config: cordova.plugins.outline.ServerConfig) {
   return util.timeoutPromise(
       new Promise<void>((fulfill, reject) => {
@@ -190,18 +195,50 @@ function validateServerCredentials() {
   });
 }
 
-function startHttpProxy(): Promise<number> {
-  return new Promise((fulfill, reject) => {
-    const newHttpProxy = httpproxytosocks.createServer({socks: `${PROXY_IP}:${SS_LOCAL_PORT}`});
-    newHttpProxy.listen(0, PROXY_IP)
-        .on('listening',
-            () => {
-              httpProxy = newHttpProxy;
-              fulfill(newHttpProxy.address().port);
-            })
-        .on('error', (e: Error) => {
-          reject(new Error(`could not start HTTP proxy: ${e.message}`));
-        });
+function startTun2socks(onDisconnected: () => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // ./badvpn-tun2socks.exe \
+    //   --tundev "tap0901:tun0:192.168.1.5:192.168.1.0:255.255.255.0" \
+    //   --netif-ipaddr 192.168.1.10 \
+    //   --netif-netmask 255.255.255.0 \
+    //   --socks-server-addr 127.0.0.1:1080
+    const args: string[] = [];
+    args.push(
+        '--tundev',
+        `tap0901:${TUN2SOCKS_TUN_DEVICE_NAME}:${TUN2SOCKS_TUN_DEVICE_IP}:${
+            TUN2SOCKS_TUN_DEVICE_NETWORK}:${TUN2SOCKS_VIRTUAL_ROUTER_NETMASK}`);
+    args.push('--netif-ipaddr', TUN2SOCKS_VIRTUAL_ROUTER_IP);
+    args.push('--netif-netmask', TUN2SOCKS_VIRTUAL_ROUTER_NETMASK);
+    args.push('--socks-server-addr', `${PROXY_IP}:${SS_LOCAL_PORT}`);
+
+    try {
+      console.log('A');
+      tun2socks = execFile(pathToEmbeddedExe('badvpn-tun2socks'), args);
+      console.log('B');
+
+      tun2socks.stdout.on('data', (data) => {
+        console.log(`tun2socks stdout:\n${data}`);
+      });
+
+      tun2socks.stderr.on('data', (data) => {
+        console.error(`tun2socks stderr:\n${data}`);
+      });
+
+
+      tun2socks.on('exit', (code, signal) => {
+        if (signal) {
+          console.log(`tun2socks exited with signal ${signal}`);
+        } else {
+          console.log(`tun2socks exited with code ${code}`);
+        }
+        onDisconnected();
+      });
+
+      console.log('C');
+      resolve();
+    } catch (e) {
+      reject(e);
+    }
   });
 }
 
@@ -213,52 +250,37 @@ function stopSsLocal() {
   return Promise.resolve();
 }
 
-function stopHttpProxy() {
-  return new Promise((resolve) => {
-    if (httpProxy) {
-      // Because http-proxy-to-socks doesn't give us any control over
-      // connection timeouts, it can take a long time for the server to
-      // fully shutdown - freezing the UI. So, resolve immediately
-      // and log when it finally happens.
-      httpProxy.close((e: Error) => {
-        if (e) {
-          console.error('could not stop HTTP proxy', e);
-          return;
-        }
-        console.log('HTTP proxy stopped');
-      });
-    }
-    resolve();
-  });
+function stopTun2socks() {
+  if (!tun2socks) {
+    return Promise.resolve();
+  }
+  tun2socks.kill();
+  return Promise.resolve();
 }
 
 // Configures the system to use our proxy.
-// TODO: Make some effort to backup and restore the system proxy settings.
-function configureSystemProxy(httpProxyPort: number) {
+// TODO: argh has to be admin!
+function configureSystemProxy(tun2socksVirtualRouterIp: string, proxyServerIp: string) {
   try {
-    execFileSync(
-        pathToEmbeddedExe('setsystemproxy'), ['on', `${PROXY_IP}:${httpProxyPort}`],
-        {timeout: 1500});
+    const out = execFileSync(
+        pathToEmbeddedExe('setsystemproxy'), ['on', TUN2SOCKS_VIRTUAL_ROUTER_IP, proxyServerIp],
+        {timeout: 5000});
+
+    console.log(`setsystemproxy stdout: ${out}`);
+
   } catch (e) {
+    console.log(`setsystemproxy stdout: ${e.stdout.toString()}`);
+    console.log(`setsystemproxy stderr: ${e.stderr.toString()}`);
+    // console.log(e);
     throw new Error(`could not configure system proxy: ${e.stderr}`);
   }
 }
 
 // Configures the system to no longer use our proxy.
 function resetSystemProxy() {
-  console.log(`resetting system proxy`);
-  try {
-    execFileSync(pathToEmbeddedExe('setsystemproxy'), ['off']);
-  } catch (e) {
-    throw new Error(`could not reset system proxy: ${e.stderr}`);
-  }
+  return Promise.resolve();
 }
 
 export function teardownProxy() {
-  try {
-    resetSystemProxy();
-    return Promise.all([stopSsLocal(), stopHttpProxy()]);
-  } catch (e) {
-    return Promise.reject(e);
-  }
+  return Promise.resolve();
 }
