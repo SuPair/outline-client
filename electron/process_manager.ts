@@ -44,9 +44,9 @@ const SS_LOCAL_PORT = 1081;
 
 // TODO: read these from the system!
 const TUN2SOCKS_TUN_DEVICE_NAME = 'tun0';
-const TUN2SOCKS_TUN_DEVICE_IP = '192.168.1.5';
-const TUN2SOCKS_VIRTUAL_ROUTER_IP = '192.168.1.10';
-const TUN2SOCKS_TUN_DEVICE_NETWORK = '192.168.1.0';
+const TUN2SOCKS_TUN_DEVICE_IP = '192.168.7.2';
+const TUN2SOCKS_VIRTUAL_ROUTER_IP = '192.168.7.1';
+const TUN2SOCKS_TUN_DEVICE_NETWORK = '192.168.7.0';
 const TUN2SOCKS_VIRTUAL_ROUTER_NETMASK = '255.255.255.0';
 
 let previousGateway:string;
@@ -214,8 +214,8 @@ function validateServerCredentials() {
 function startTun2socks(onDisconnected: () => void): Promise<void> {
   return new Promise((resolve, reject) => {
     // ./badvpn-tun2socks.exe \
-    //   --tundev "tap0901:tun0:192.168.1.5:192.168.1.0:255.255.255.0" \
-    //   --netif-ipaddr 192.168.1.10 \
+    //   --tundev "tap0901:tun0:192.168.7.2:192.168.1.0:255.255.255.0" \
+    //   --netif-ipaddr 192.168.7.1 \
     //   --netif-netmask 255.255.255.0 \
     //   --socks-server-addr 127.0.0.1:1080
     const args: string[] = [];
@@ -228,18 +228,7 @@ function startTun2socks(onDisconnected: () => void): Promise<void> {
     args.push('--socks-server-addr', `${PROXY_IP}:${SS_LOCAL_PORT}`);
 
     try {
-      console.log('A');
       tun2socks = execFile(pathToEmbeddedExe('badvpn-tun2socks'), args);
-      console.log('B');
-
-      tun2socks.stdout.on('data', (data) => {
-        console.log(`tun2socks stdout:\n${data}`);
-      });
-
-      tun2socks.stderr.on('data', (data) => {
-        console.error(`tun2socks stderr:\n${data}`);
-      });
-
 
       tun2socks.on('exit', (code, signal) => {
         if (signal) {
@@ -250,7 +239,6 @@ function startTun2socks(onDisconnected: () => void): Promise<void> {
         onDisconnected();
       });
 
-      console.log('C');
       resolve();
     } catch (e) {
       reject(e);
