@@ -49,6 +49,8 @@ const TUN2SOCKS_VIRTUAL_ROUTER_IP = '192.168.1.10';
 const TUN2SOCKS_TUN_DEVICE_NETWORK = '192.168.1.0';
 const TUN2SOCKS_VIRTUAL_ROUTER_NETMASK = '255.255.255.0';
 
+let previousGateway:string;
+
 const CREDENTIALS_TEST_DOMAINS = ['example.com', 'ietf.org', 'wikipedia.org'];
 const REACHABILITY_TEST_TIMEOUT_MS = 10000;
 
@@ -97,7 +99,7 @@ export function launchProxy(
           console.log('waiting 5s for tun2socks to come up...');
           setTimeout(() => {
             try {
-              configureSystemProxy(TUN2SOCKS_VIRTUAL_ROUTER_IP, config.host || '');
+              configureRouting(TUN2SOCKS_VIRTUAL_ROUTER_IP, config.host || '');
               F();
             } catch (e) {
               R(e);
@@ -272,29 +274,54 @@ function stopTun2socks() {
   return Promise.resolve();
 }
 
-// Configures the system to use our proxy.
-// TODO: argh has to be admin!
-function configureSystemProxy(tun2socksVirtualRouterIp: string, proxyServerIp: string) {
+function configureRouting(tun2socksVirtualRouterIp: string, proxyServerIp: string) {
   try {
     const out = execFileSync(
         pathToEmbeddedExe('setsystemproxy'), ['on', TUN2SOCKS_VIRTUAL_ROUTER_IP, proxyServerIp],
         {timeout: 5000});
+    console.log(`setsystemproxy:\n===\n${out}===`);
 
-    console.log(`setsystemproxy stdout: ${out}`);
-
+    // Store the previous gateway, for disconnection.
+    const lines = out.toString().split('\n');
+    const gatewayLines = lines.filter((line) => {
+      return line.startsWith('current gateway:');
+    });
+    if (gatewayLines.length < 1) {
+      throw new Error(`could not determine previous gateway`);
+    }
+    const tokens = gatewayLines[0].split(' ');
+    const p = tokens[tokens.length-1];
+    console.log(`previous gateway: ${p}`);
+    previousGateway = p;
   } catch (e) {
-    console.log(`setsystemproxy stdout: ${e.stdout.toString()}`);
-    console.log(`setsystemproxy stderr: ${e.stderr.toString()}`);
-    // console.log(e);
-    throw new Error(`could not configure system proxy: ${e.stderr}`);
+    console.log(`setsystemproxy failed:\n===\n${e.stdout.toString()}===`);
+    throw new Error(`could not configure routing`);
   }
 }
 
-// Configures the system to no longer use our proxy.
-function resetSystemProxy() {
-  return Promise.resolve();
+// TODO: parameter for current proxy, so route can be removed
+function resetRouting() {
+  if (!previousGateway) {
+    throw new Error('disconnecting but i do not know the previous gateway');
+  }
+
+  try {
+    const out = execFileSync(
+        pathToEmbeddedExe('setsystemproxy'), ['off', previousGateway, '123.123.123.123'],
+        {timeout: 5000});
+    console.log(`setsystemproxy stdout:\n===\n${out}===`);
+  } catch (e) {
+    console.log(`setsystemproxy stdout: ${e.stdout.toString()}`);
+    console.log(`setsystemproxy stderr: ${e.stderr.toString()}`);
+    throw new Error(`could not reset routing: ${e.stderr}`);
+  }
 }
 
 export function teardownProxy() {
-  return Promise.resolve();
+  try {
+    resetRouting();
+  } catch (e) {
+    console.log(`failed to reset routing: ${e.message}`);
+  }
+  return Promise.all([stopSsLocal(), stopTun2socks()]);
 }

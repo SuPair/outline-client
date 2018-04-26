@@ -135,13 +135,30 @@ int main(int argc, char* argv[]) {
   // DNS server.
   PMIB_IPFORWARDROW dnsRow = NULL;
 
+  int lowestIm = 1000;
+
+  DWORD dwStatus = 0;
+
   for (int i = 0; i < pIpForwardTable->dwNumEntries; i++) {
     if (pIpForwardTable->table[i].dwForwardDest == 0) {
-      if (pRow) {
-        printf("sorry, cannot handle multiple default gateways\n");
+      // default gateway.
+      // there can be many of these on the system.
+      // assume the one with lowest interface metric is the system default.
+      int ii = getBest(pIpForwardTable->table[i].dwForwardNextHop);
+      int im = getInterfaceMetric(ii);
+      if (im < lowestIm) {
+        // new candidate for real system gateway.
+        pRow = &(pIpForwardTable->table[i]);
+        lowestIm = im;
+      }
+
+      // delete the gateway.
+      dwStatus = DeleteIpForwardEntry(&(pIpForwardTable->table[i]));
+      if (dwStatus != ERROR_SUCCESS) {
+        printf("could not delete gateway\n");
         exit(1);
       }
-      pRow = &(pIpForwardTable->table[i]);
+      printf("deleted gateway\n");
     } else if (pIpForwardTable->table[i].dwForwardDest == proxyServerIp) {
       if (proxyRow) {
         printf("found multiple routes to proxy server, cannot handle\n");
@@ -159,10 +176,8 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  DWORD dwStatus = 0;
-
   if (!pRow) {
-    printf("no default gateway - are you connected to the internet?\n");
+    printf("no gateways on system - are you connected to the internet?\n");
     exit(1);
   }
 
@@ -171,8 +186,8 @@ int main(int argc, char* argv[]) {
   DWORD oldGateway = pRow->dwForwardNextHop;
 
   // which interfaces are the old and new gateway on?
-// NOTE: for the new gateway, tun2socks must be active before
-// getBest will work!
+  // NOTE: for the new gateway, tun2socks must be active before
+  // getBest will work!
   int oldGatewayInterfaceIndex = getBest(oldGateway);
   int newGatewayInterfaceIndex = getBest(NewGateway);
 
@@ -215,14 +230,6 @@ int main(int argc, char* argv[]) {
     exit(1);
   }
   printf("set new gateway\n");
-
-  // Delete the old default gateway entry.
-  dwStatus = DeleteIpForwardEntry(pRow);
-  if (dwStatus != NO_ERROR) {
-    printf("could not remove current gateway\n");
-    exit(1);
-  }
-  printf("removed current gateway\n");
 
   // Add a route to the proxy server.
   if (proxyRow) {
