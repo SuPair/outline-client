@@ -171,8 +171,13 @@ int main(int argc, char* argv[]) {
   DWORD oldGateway = pRow->dwForwardNextHop;
 
   // which interfaces are the old and new gateway on?
+// NOTE: for the new gateway, tun2socks must be active before
+// getBest will work!
   int oldGatewayInterfaceIndex = getBest(oldGateway);
   int newGatewayInterfaceIndex = getBest(NewGateway);
+
+  printf("old gateway interface index: %d\n", oldGatewayInterfaceIndex);
+  printf("new gateway interface index: %d\n", newGatewayInterfaceIndex);
 
   // print the old gateway.
   char oldGatewayIp[128];

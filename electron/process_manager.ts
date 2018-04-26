@@ -89,7 +89,21 @@ export function launchProxy(
         throw errors.ErrorCode.HTTP_PROXY_START_FAILURE;
       })
       .then((port) => {
-        configureSystemProxy(TUN2SOCKS_VIRTUAL_ROUTER_IP, config.host || '');
+        // there is a slight delay before tun2socks
+        // correctly configures the virtual router. before then,
+        // configuring the route table will not work as expected.
+        // TODO: hack tun2socks to write something to stdout when it's ready
+        return new Promise((F, R) => {
+          console.log('waiting 5s for tun2socks to come up...');
+          setTimeout(() => {
+            try {
+              configureSystemProxy(TUN2SOCKS_VIRTUAL_ROUTER_IP, config.host || '');
+              F();
+            } catch (e) {
+              R(e);
+            }
+          }, 5000);
+        });
       })
       .catch((e) => {
         throw errors.ErrorCode.CONFIGURE_SYSTEM_PROXY_FAILURE;
