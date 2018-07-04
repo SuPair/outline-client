@@ -37,10 +37,11 @@
 <link rel="import" href="about-view.html">
 <link rel="import" href="add-server-view.html">
 <link rel="import" href="feedback-view.html">
-<link rel="import" href="servers-view.html">
-<link rel="import" href="server-rename-dialog.html">
 <link rel="import" href="licenses-view.html">
 <link rel="import" href="outline-icons.html">
+<link rel="import" href="privacy-view.html">
+<link rel="import" href="servers-view.html">
+<link rel="import" href="server-rename-dialog.html">
 
 <dom-module id="app-root">
 
@@ -80,14 +81,12 @@
       }
 
       app-toolbar [main-title] {
-        display: inline-block;
-        line-height: var(--app-toolbar-height);
-        vertical-align: top;
         flex: 2 1 100%;
       }
 
-      app-toolbar > .servers {
-        font-family: 'Google Sans', 'Roboto', sans-serif;
+      app-toolbar img {
+        height: 19px;
+        margin-top: 2px;
       }
 
       app-toolbar paper-icon-button {
@@ -113,6 +112,7 @@
         padding: 0;
       }
 
+      /* rtl:begin:ignore */
       #drawer-nav paper-icon-item {
         cursor: pointer;
         font-size: 16px;
@@ -127,6 +127,12 @@
       #drawer-nav paper-icon-item:focus::after {
         color: var(--medium-green);
         background-color: var(--light-gray);
+      }
+      /* rtl:end:ignore */
+
+      /* Manually reverse icons that require mirroring in RTL languages. */
+      :host(:dir(rtl)) #feedback-icon, :host(:dir(rtl)) #backBtn {
+        transform: scaleX(-1);
       }
 
       #logo-nav {
@@ -215,6 +221,8 @@
     <app-location route="{{route}}" url-space-regex="^/index.html" use-hash-as-path></app-location>
     <app-route route="{{route}}" pattern="/:page" data="{{routeData}}"></app-route>
 
+    <privacy-view id="privacyView" root-path="[[rootPath]]" localize="[[localize]]" hidden></privacy-view>
+
     <app-header-layout fullbleed>
       <app-header slot="header" fixed>
         <app-toolbar>
@@ -222,7 +230,10 @@
             <paper-icon-button id="menuBtn" hidden$="[[shouldShowBackButton]]" icon="menu" on-tap="openDrawer"></paper-icon-button>
             <paper-icon-button id="backBtn" hidden$="[[!shouldShowBackButton]]" icon="arrow-back" on-tap="_goBack"></paper-icon-button>
           </div>
-          <div main-title class$="[[page]]">[[localize(pageTitleKey)]]</div>
+          <div main-title class$="[[page]]">
+            <img src$="[[rootPath]]assets/outline-client-logo.svg" hidden$="[[!shouldShowAppLogo]]">
+            <div hidden$="[[shouldShowAppLogo]]">[[localize(pageTitleKey)]]</div>
+          </div>
           <div id="app-toolbar-right">
             <paper-icon-button id="addBtn" icon="add" on-tap="promptAddServer" hidden$="[[!shouldShowAddButton]]"></paper-icon-button>
           </div>
@@ -233,7 +244,8 @@
         <servers-view name="servers" id="serversView" servers="{{servers}}" root-path="[[rootPath]]" localize="[[localize]]"></servers-view>
         <feedback-view name="feedback" id="feedbackView" localize="[[localize]]"></feedback-view>
         <about-view name="about" id="aboutView" localize="[[localize]]" root-path="[[rootPath]]"></about-view>
-        <licenses-view name="licenses" id="licensesView" localize="[[localize]]" root-path="[[rootPath]]"></licenses-view>
+        <!-- Do not mirror licenses text, as it is not localized. -->
+        <licenses-view name="licenses" id="licensesView" dir="ltr" localize="[[localize]]" root-path="[[rootPath]]"></licenses-view>
       </iron-pages>
 
     </app-header-layout>
@@ -284,7 +296,7 @@
           <span class="item-label">[[localize('servers-menu-item')]]</span>
         </paper-icon-item>
         <paper-icon-item name="feedback">
-          <iron-icon icon="feedback" slot="item-icon"></iron-icon>
+          <iron-icon id="feedback-icon" icon="feedback" slot="item-icon"></iron-icon>
           [[localize('feedback-page-title')]]
         </paper-icon-item>
         <paper-icon-item name="about">
@@ -341,6 +353,11 @@
       ready: function () {
         var url = this.rootPath + 'messages/' + this.language + '.json';
         this.loadResources(url, this.language);
+        const languageProperties = this.LANGUAGES_AVAILABLE[this.language];
+        if (!!languageProperties && languageProperties.dir === 'rtl') {
+          document.documentElement.setAttribute('dir', 'rtl');
+          this.$.drawer.align = 'right';
+        }
 
         // Workaround for paper-behaviors' craptastic keyboard focus detection:
         // https://github.com/PolymerElements/paper-behaviors/issues/80
@@ -455,6 +472,10 @@
           type: Boolean,
           computed: '_computeShouldShowQuitButton(platform)',
           value: false
+        },
+        shouldShowAppLogo: {
+          type: Boolean,
+          computed: '_computeShouldShowAppLogo(page)'
         }
       },
       openDrawer: function () {
@@ -577,7 +598,10 @@
       },
       showServerRename: function(event) {
         this.$.serverRenameDialog.open(event.detail.serverName, event.detail.serverId);
-      }
+      },
+      _computeShouldShowAppLogo: function(page) {
+        return page === 'servers';
+      },
     });
   </script>
 </dom-module>

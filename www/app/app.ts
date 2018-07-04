@@ -78,8 +78,11 @@ export class App {
     this.rootEl.addEventListener(
         'NonSystemVpnWarningDismissed', this.nonSystemVpnWarningDismissed.bind(this));
     this.rootEl.addEventListener(
+        'AutoConnectDialogDismissed', this.autoConnectDialogDismissed.bind(this));
+    this.rootEl.addEventListener(
         'ShowServerRename', this.rootEl.showServerRename.bind(this.rootEl));
     this.feedbackViewEl.$.submitButton.addEventListener('tap', this.submitFeedback.bind(this));
+    this.rootEl.addEventListener('PrivacyTermsAcked', this.ackPrivacyTerms.bind(this));
 
     // Register handlers for events published to our event queue.
     this.eventQueue.subscribe(events.ServerAdded, this.showServerAdded.bind(this));
@@ -92,6 +95,9 @@ export class App {
 
     this.eventQueue.startPublishing();
 
+    if (!this.arePrivacyTermsAcked()) {
+      this.displayPrivacyView();
+    }
     this.displayZeroStateUi();
     this.pullClipboardText();
   }
@@ -154,13 +160,33 @@ export class App {
     }
   }
 
+  private arePrivacyTermsAcked() {
+    try {
+      return this.settings.get(SettingsKey.PRIVACY_ACK) === 'true';
+    } catch (e) {
+      console.error(`could not read privacy acknowledgement setting, assuming not akcnowledged`);
+    }
+    return false;
+  }
+
+  private displayPrivacyView() {
+    this.rootEl.$.serversView.hidden = true;
+    this.rootEl.$.privacyView.hidden = false;
+  }
+
+  private ackPrivacyTerms() {
+    this.rootEl.$.serversView.hidden = false;
+    this.rootEl.$.privacyView.hidden = true;
+    this.settings.set(SettingsKey.PRIVACY_ACK, 'true');
+  }
+
   private handleClipboardText(text: string) {
     // Shorten, sanitise.
     // Note that we always check the text, even if the contents are same as last time, because we
     // keep an in-memory cache of user-ignored access keys.
     text = text.substring(0, 1000).trim();
     try {
-      this.confirmAddServer(text, true);
+      this.confirmAddServer(this.unwrapInvite(text), true);
     } catch (err) {
       // Don't alert the user; high false positive rate.
     }
@@ -193,7 +219,7 @@ export class App {
     const accessKey = event.detail.accessKey;
     console.debug('Got add server confirmation request from UI');
     try {
-      this.confirmAddServer(accessKey);
+      this.confirmAddServer(this.unwrapInvite(accessKey));
     } catch (err) {
       console.error('Failed to confirm add sever.', err);
       const addServerView = this.rootEl.$.addServerView;
@@ -274,12 +300,40 @@ export class App {
           card.state = 'CONNECTED';
           this.rootEl.showToast(this.localize('server-connected', 'serverName', server.name));
           this.maybeShowNonSystemWarning();
+          this.maybeShowAutoConnectDialog();
         },
         (err: errors.OutlinePluginError) => {
           console.error(`Failed to connect to server with plugin error: ${err.name}`);
           card.state = 'DISCONNECTED';
           this.showLocalizedError(err);
         });
+  }
+
+  private maybeShowAutoConnectDialog() {
+    // TODO: remove this check when Windows full system VPN is released.
+    let vpnWarningDismissed = false;
+    try {
+      vpnWarningDismissed = this.getNonSystemVpnWarningDismissed();
+    } catch (e) {
+      console.error(`Could not read full-system VPN warning status, assuming not dismissed: ${e}`);
+    }
+    if (!this.hasSystemVpnSupport && !vpnWarningDismissed) {
+      // Only show the dialog on Windows if the non-VPN warning has been dismissed.
+      return;
+    }
+    let dismissed = false;
+    try {
+      dismissed = this.settings.get(SettingsKey.AUTO_CONNECT_DIALOG_DISMISSED) === 'true';
+    } catch (e) {
+      console.error(`Failed to read auto-connect dialog status, assuming not dismissed: ${e}`);
+    }
+    if (!dismissed) {
+      this.rootEl.$.serversView.$.autoConnectDialog.show();
+    }
+  }
+
+  private autoConnectDialogDismissed() {
+    this.settings.set(SettingsKey.AUTO_CONNECT_DIALOG_DISMISSED, 'true');
   }
 
   private maybeShowNonSystemWarning() {
@@ -416,11 +470,41 @@ export class App {
         });
   }
 
+  // If the provided url is actually an invite page, with the shadowsocks link in a URL
+  // fragment, this function extracts the shadowsocks link and returns it.  Otherwise,
+  // it returns the input unmodified.
+  private unwrapInvite(url: string): string {
+    try {
+      const invite: URL = new URL(url);
+      const baseURLs: string[] = [
+        'https://s3.amazonaws.com/outline-vpn/invite.html',
+        'https://s3.amazonaws.com/outline-vpn/index.html'
+      ];
+      for (const base of baseURLs) {
+        const parsed: URL = new URL(base);
+        if (parsed.origin !== invite.origin || parsed.pathname !== invite.pathname) {
+          continue;
+        }
+        const fragment: string = decodeURIComponent(invite.hash);
+        const mark = 'ss://';
+        const index = fragment.indexOf(mark);
+        if (index < 0) {
+          return url;
+        }
+        return fragment.substr(index);
+      }
+    } catch (e) {
+      console.warn('Invalid invite', e);
+    }
+    return url;
+  }
+
   private registerUrlInterceptionListener(urlInterceptor?: UrlInterceptor) {
     if (!urlInterceptor) {
       return console.warn('no urlInterceptor, ss:// urls will not be intercepted');
     }
     urlInterceptor.registerListener((url) => {
+      url = this.unwrapInvite(url);
       const ssProto = SHADOWSOCKS_URI.PROTOCOL;
       if (!url || url.substring(0, ssProto.length) !== ssProto) {
         // This check is necessary to handle empty and malformed install-referrer URLs in Android.

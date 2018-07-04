@@ -20,6 +20,7 @@ const babelify = require('babelify');
 const babel_preset_env = require('babel-preset-env');
 const child_process = require('child_process');
 const fs = require('fs');
+const generateRtlCss = require('./scripts/generate_rtl_css.js');
 const gulp = require('gulp');
 const gulpif = require('gulp-if');
 const gutil = require('gulp-util');
@@ -33,14 +34,11 @@ const SRC_DIR = 'www';
 
 const CONFIG_BY_PLATFORM = {
   android: {
-    targetDir: `platforms/android/assets/${SRC_DIR}`,
+    targetDir: `platforms/android/app/src/main/assets/${SRC_DIR}`,
     platformArgs: '--gradleArg=-PcdvBuildMultipleApks=true'
   },
   browser: {targetDir: `platforms/browser/${SRC_DIR}`},
-  ios: {
-    targetDir: `platforms/ios/${SRC_DIR}`,
-    compileArgs: '--device'
-  },
+  ios: {targetDir: `platforms/ios/${SRC_DIR}`, compileArgs: '--device'},
   osx: {targetDir: `platforms/osx/${SRC_DIR}`}
 };
 
@@ -224,26 +222,31 @@ function build(platform, config) {
         writeEnvJson(platform, config, envVars.RELEASE);
         transpileBowerComponents(config).on('finish', function() {
           transpileUiComponents(config).on('finish', function() {
-            const compileArgs = config.compileArgs || '';
-            const releaseArgs = envVars.RELEASE ? getReleaseCompileArgs(platform, envVars) : '';
-            const platformArgs = config.platformArgs || '';
-            // Do this now, otherwise "cordova compile" fails.
-            // TODO: use some gulp plugin
-            // -c means "use file's checksum, not last modified time"
-            const syncXcode = platform === 'ios' || platform === 'osx'
-                ? `rsync -avzc apple/xcode/${platform}/ platforms/${platform}/` : ':';
-            runCommand(syncXcode, {}, () => {
-              runCommand(
-                  `cordova compile ${platform} ${compileArgs} ${releaseArgs} -- ${platformArgs}`,
-                  {}, function() {
-                    if (shouldWatch) {
-                      gutil.log('Running...');
-                      runCommand(`cordova run ${platform} --noprepare --nobuild`);
-                    } else {
-                      gutil.log('Done');
-                    }
+            generateRtlCss(
+                `${config.targetDir}/ui_components/*.html`, `${config.targetDir}/ui_components`)
+                .on('finish', function() {
+                  const compileArgs = config.compileArgs || '';
+                  const releaseArgs = envVars.RELEASE ? getReleaseCompileArgs(platform, envVars) : '';
+                  const platformArgs = config.platformArgs || '';
+                  // Do this now, otherwise "cordova compile" fails.
+                  // TODO: use some gulp plugin
+                  // -c means "use file's checksum, not last modified time"
+                  const syncXcode = platform === 'ios' || platform === 'osx' ?
+                      `rsync -avzc apple/xcode/${platform}/ platforms/${platform}/` :
+                      ':';
+                  runCommand(syncXcode, {}, () => {
+                    runCommand(
+                        `cordova compile ${platform} ${compileArgs} ${releaseArgs} -- ${platformArgs}`,
+                        {}, function() {
+                          if (shouldWatch) {
+                            gutil.log('Running...');
+                            runCommand(`cordova run ${platform} --noprepare --nobuild`);
+                          } else {
+                            gutil.log('Done');
+                          }
+                        });
                   });
-            });
+                });
           });
         });
       });
