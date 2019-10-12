@@ -15,19 +15,25 @@
 package org.outline.vpn;
 
 import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.content.res.Resources;
 import android.net.ConnectivityManager;
 import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
 import android.net.NetworkRequest;
 import android.net.VpnService;
 import android.os.Binder;
+import android.os.Build;
 import android.os.IBinder;
 import android.support.v4.content.LocalBroadcastManager;
+
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -50,6 +56,7 @@ public class VpnTunnelService extends VpnService {
   private static final int THREAD_POOL_SIZE = 5;
   private static final int NOTIFICATION_SERVICE_ID = 1;
   private static final int NOTIFICATION_COLOR = 0x00BFA5;
+  private static final String NOTIFICATION_CHANNEL_ID = "outline-vpn";
   private static final String CONNECTION_ID_KEY = "id";
   private static final String CONNECTION_CONFIG_KEY = "config";
 
@@ -58,8 +65,10 @@ public class VpnTunnelService extends VpnService {
   private VpnTunnel vpnTunnel;
   private Shadowsocks shadowsocks;
   private String activeConnectionId = null;
+  private JSONObject activeServerConfig = null;
   private NetworkConnectivityMonitor networkConnectivityMonitor;
   private VpnConnectionStore connectionStore;
+  private Notification.Builder notificationBuilder;
 
   public class LocalBinder extends Binder {
     public VpnTunnelService getService() {
@@ -91,13 +100,11 @@ public class VpnTunnelService extends VpnService {
     LOG.info(String.format(Locale.ROOT, "Starting VPN service: %s", intent));
     int superOnStartReturnValue = super.onStartCommand(intent, flags, startId);
     if (intent != null) {
-      boolean wasConectedAtShutdown =
-          OutlinePlugin.ConnectionStatus.CONNECTED.equals(connectionStore.getConnectionStatus());
       // VpnServiceStarter includes AUTOSTART_EXTRA in the intent if automatic start has occurred.
       boolean startedByVpnStarter =
           intent.getBooleanExtra(VpnServiceStarter.AUTOSTART_EXTRA, false);
       boolean startedByAlwaysOn = VpnService.SERVICE_INTERFACE.equals(intent.getAction());
-      if ((wasConectedAtShutdown && startedByVpnStarter) || startedByAlwaysOn) {
+      if (startedByVpnStarter || startedByAlwaysOn) {
         startLastSuccessfulConnectionOrExit();
       }
     }
@@ -138,29 +145,31 @@ public class VpnTunnelService extends VpnService {
    * @throws IllegalArgumentException if |connectionId| or |config| are missing.
    */
   public void startConnection(final String connectionId, final JSONObject config) {
-    startConnection(connectionId, config, true);
+    startConnection(connectionId, config, false);
   }
 
   private void startConnection(
-      final String connectionId, final JSONObject config, boolean performConnectivityChecks) {
+      final String connectionId, final JSONObject config, boolean isAutoStart) {
     LOG.info(String.format(Locale.ROOT, "Starting connection %s.", connectionId));
-    boolean isRestart = false;
     if (connectionId == null || config == null) {
       throw new IllegalArgumentException("Must provide a connection ID and configuration.");
-    } else if (connectionId.equals(activeConnectionId)) {
-      LOG.info(
-          String.format(Locale.ROOT, "Already running tunnel for connection ID %s", connectionId));
-      broadcastVpnStart(OutlinePlugin.ErrorCode.NO_ERROR); // Start is idempotent.
-      return;
-    } else if (activeConnectionId != null) {
+    }
+    final boolean isRestart = activeConnectionId != null;
+    if (isRestart) {
       // Broadcast the previous instance disconnect event before reassigning the connection ID.
       broadcastVpnConnectivityChange(OutlinePlugin.ConnectionStatus.DISCONNECTED);
-      isRestart = true;
+      stopForeground();
     }
     activeConnectionId = connectionId;
+    activeServerConfig = config;
+
+    OutlinePlugin.ErrorCode errorCode = OutlinePlugin.ErrorCode.NO_ERROR;
     try {
-      OutlinePlugin.ErrorCode errorCode = startShadowsocks(config, performConnectivityChecks).get();
-      if (errorCode != OutlinePlugin.ErrorCode.NO_ERROR) {
+      // Do not perform connectivity checks when connecting on startup. We should avoid failing
+      // the connection due to a network error, as network may not be ready.
+      errorCode = startShadowsocks(config, !isAutoStart).get();
+      if (!(errorCode == OutlinePlugin.ErrorCode.NO_ERROR
+              || errorCode == OutlinePlugin.ErrorCode.UDP_RELAY_NOT_ENABLED)) {
         onVpnStartFailure(errorCode);
         return;
       }
@@ -169,25 +178,31 @@ public class VpnTunnelService extends VpnService {
       return;
     }
 
-    if (!isRestart) {
-      // Only establish the VPN and connect the tunnel if this is not a connection restart.
+    if (isRestart) {
+      vpnTunnel.disconnectTunnel();
+    } else {
+      // Only establish the VPN if this is not a connection restart.
       if (!vpnTunnel.establishVpn()) {
         LOG.severe("Failed to establish the VPN");
         onVpnStartFailure(OutlinePlugin.ErrorCode.VPN_START_FAILURE);
         return;
       }
-      try {
-        vpnTunnel.connectTunnel(shadowsocks.getLocalServerAddress());
-      } catch (Exception e) {
-        LOG.log(Level.SEVERE, "Failed to connect the tunnel", e);
-        onVpnStartFailure(OutlinePlugin.ErrorCode.VPN_START_FAILURE);
-        return;
-      }
       startNetworkConnectivityMonitor();
     }
+
+    final boolean remoteUdpForwardingEnabled = isAutoStart
+        ? connectionStore.isUdpSupported()
+        : errorCode == OutlinePlugin.ErrorCode.NO_ERROR;
+    try {
+      vpnTunnel.connectTunnel(shadowsocks.getLocalServerAddress(), remoteUdpForwardingEnabled);
+    } catch (Exception e) {
+      LOG.log(Level.SEVERE, "Failed to connect the tunnel", e);
+      onVpnStartFailure(OutlinePlugin.ErrorCode.VPN_START_FAILURE);
+      return;
+    }
     broadcastVpnStart(OutlinePlugin.ErrorCode.NO_ERROR);
-    displayPersistentNotification(config);
-    storeActiveConnection(config);
+    startForegroundWithNotification(config, OutlinePlugin.ConnectionStatus.CONNECTED);
+    storeActiveConnection(connectionId, config, remoteUdpForwardingEnabled);
   }
 
   /**
@@ -232,8 +247,9 @@ public class VpnTunnelService extends VpnService {
   /* Helper method to tear down an active connection. */
   private void tearDownActiveConnection() {
     stopVpnTunnel();
-    removePersistentNotification();
+    stopForeground();
     activeConnectionId = null;
+    activeServerConfig = null;
     stopNetworkConnectivityMonitor();
     connectionStore.setConnectionStatus(OutlinePlugin.ConnectionStatus.DISCONNECTED);
   }
@@ -316,7 +332,7 @@ public class VpnTunnelService extends VpnService {
         boolean isReachable = reachabilityCheckResult.get();
         boolean credentialsAreValid = credentialsCheckResult.get();
         LOG.info(String.format(Locale.ROOT,
-            "Server connectivity: UDP forwarding disabled, server %s, credentials %s",
+            "Server connectivity: UDP forwarding disabled, server %s, creds. %s",
             isReachable ? "reachable" : "unreachable", credentialsAreValid ? "valid" : "invalid"));
         if (credentialsAreValid) {
           return OutlinePlugin.ErrorCode.UDP_RELAY_NOT_ENABLED;
@@ -344,16 +360,32 @@ public class VpnTunnelService extends VpnService {
     @Override
     public void onAvailable(Network network) {
       NetworkInfo networkInfo = connectivityManager.getNetworkInfo(network);
-      NetworkInfo activeNetworkInfo = connectivityManager.getActiveNetworkInfo();
-      LOG.fine(String.format(Locale.ROOT, "Network available: %s\nActive network: %s", networkInfo,
-          activeNetworkInfo));
-      if (networkInfo == null || !networkEquals(networkInfo, activeNetworkInfo)) {
-        return;
-      } else if (activeNetworkInfo != null
-          && activeNetworkInfo.getState() != NetworkInfo.State.CONNECTED) {
+      LOG.fine(String.format(Locale.ROOT, "Network available: %s", networkInfo));
+      if (networkInfo == null || networkInfo.getState() != NetworkInfo.State.CONNECTED) {
         return;
       }
       broadcastVpnConnectivityChange(OutlinePlugin.ConnectionStatus.CONNECTED);
+      startForegroundWithNotification(activeServerConfig, OutlinePlugin.ConnectionStatus.CONNECTED);
+
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        // Indicate that traffic will be sent over the current active network.
+        // Although setting the underlying network to an available network may not seem like the
+        // correct behavior, this method has been observed only to fire only when a preferred
+        // network becomes available. It will not fire, for example, when the mobile network becomes
+        // available if WiFi is the active network. Additionally, `getActiveNetwork` and
+        // `getActiveNetworkInfo` have been observed to return the underlying network set by us.
+        setUnderlyingNetworks(new Network[] {network});
+      }
+
+      final boolean wasUdpSupported = connectionStore.isUdpSupported();
+      final boolean isUdpSupported = ShadowsocksConnectivity.isUdpForwardingEnabled(
+          Shadowsocks.LOCAL_SERVER_ADDRESS, Integer.parseInt(Shadowsocks.LOCAL_SERVER_PORT));
+      connectionStore.setIsUdpSupported(isUdpSupported);
+      LOG.info(String.format("UDP support: %s -> %s", wasUdpSupported, isUdpSupported));
+      if (isUdpSupported != wasUdpSupported) {
+        // UDP forwarding support changed with the network; restart the connection.
+        startConnection(activeConnectionId, activeServerConfig);
+      }
     }
 
     @Override
@@ -366,27 +398,29 @@ public class VpnTunnelService extends VpnService {
         return;
       }
       broadcastVpnConnectivityChange(OutlinePlugin.ConnectionStatus.RECONNECTING);
-    }
+      startForegroundWithNotification(
+          activeServerConfig, OutlinePlugin.ConnectionStatus.RECONNECTING);
 
-    // Returns whether the underlying networks of NetworkInfo objects are equal.
-    // NetworkInfo.equals performs identity comparison, which is not useful in this context.
-    private boolean networkEquals(final NetworkInfo a, final NetworkInfo b) {
-      if (a == null || b == null) {
-        return false;
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        setUnderlyingNetworks(null);
       }
-      final String aExtraInfo = a.getExtraInfo();
-      final String bExtraInfo = b.getExtraInfo();
-      boolean extraInfoIsEqual = aExtraInfo == null ? bExtraInfo == null
-                                                    : aExtraInfo.equals(bExtraInfo);
-      return extraInfoIsEqual && a.getType() == b.getType() && a.getState() == b.getState();
     }
   }
 
   private void startNetworkConnectivityMonitor() {
     final ConnectivityManager connectivityManager =
         (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-    NetworkRequest.Builder builder = new NetworkRequest.Builder();
-    connectivityManager.registerNetworkCallback(builder.build(), networkConnectivityMonitor);
+    NetworkRequest request = new NetworkRequest.Builder()
+                                 .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                                 .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
+                                 .build();
+    // `registerNetworkCallback` returns the VPN interface as the default network since Android P.
+    // Use `requestNetwork` instead (requires android.permission.CHANGE_NETWORK_STATE).
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+      connectivityManager.registerNetworkCallback(request, networkConnectivityMonitor);
+    } else {
+      connectivityManager.requestNetwork(request, networkConnectivityMonitor);
+    }
   }
 
   private void stopNetworkConnectivityMonitor() {
@@ -450,55 +484,87 @@ public class VpnTunnelService extends VpnService {
       return;
     }
     try {
-      // Do not perform connectivity checks when connecting on startup. We should avoid failing the
-      // connection due to a network error, as network may not be ready.
+      final JSONObject config = connection.getJSONObject(CONNECTION_CONFIG_KEY);
+      // Start the service in the foreground as per Android 8+ background service execution limits.
+      // Requires android.permission.FOREGROUND_SERVICE since Android P.
+      startForegroundWithNotification(config, OutlinePlugin.ConnectionStatus.RECONNECTING);
       startConnection(connection.getString(CONNECTION_ID_KEY),
-          connection.getJSONObject(CONNECTION_CONFIG_KEY), false);
+          connection.getJSONObject(CONNECTION_CONFIG_KEY), true);
     } catch (JSONException e) {
       LOG.log(Level.SEVERE, "Failed to retrieve JSON connection data", e);
       stopSelf();
     }
   }
 
-  private void storeActiveConnection(final JSONObject config) {
+  private void storeActiveConnection(
+      final String connectionId, final JSONObject config, boolean isUdpSupported) {
     LOG.info("Storing active connection.");
     JSONObject connection = new JSONObject();
     try {
-      connection.put(CONNECTION_ID_KEY, activeConnectionId).put(CONNECTION_CONFIG_KEY, config);
+      connection.put(CONNECTION_ID_KEY, connectionId).put(CONNECTION_CONFIG_KEY, config);
       connectionStore.save(connection);
     } catch (JSONException e) {
       LOG.log(Level.SEVERE, "Failed to store JSON connection data", e);
     }
     connectionStore.setConnectionStatus(OutlinePlugin.ConnectionStatus.CONNECTED);
+    connectionStore.setIsUdpSupported(isUdpSupported);
   }
 
-  // Notifications
+  // Foreground service & notifications
 
-  /* Displays a persistent notification that sets a pending intent to open the app. */
-  private void displayPersistentNotification(final JSONObject serverConfig) {
+  /* Starts the service in the foreground and  displays a persistent notification. */
+  private void startForegroundWithNotification(
+      final JSONObject serverConfig, OutlinePlugin.ConnectionStatus status) {
     try {
-      Intent launchIntent = new Intent(this, getPackageMainActivityClass());
-      PendingIntent mainActivityIntent =
-          PendingIntent.getActivity(this, 0, launchIntent, PendingIntent.FLAG_UPDATE_CURRENT);
-      Notification.Builder builder =
-          new Notification.Builder(this)
-              .setContentTitle(getServerName(serverConfig))
-              .setContentText("Connected")
-              .setSmallIcon(getResourceIdForDrawable("small_icon"))
-              .setColor(NOTIFICATION_COLOR)
-              .setVisibility(Notification.VISIBILITY_SECRET) // Don't display in lock screen
-              .setContentIntent(mainActivityIntent)
-              .setShowWhen(true)
-              .setUsesChronometer(true);
-      startForeground(NOTIFICATION_SERVICE_ID, builder.getNotification());
+      if (notificationBuilder == null) {
+        // Cache the notification builder so we can update the existing notification - creating a
+        // new notification has the side effect of resetting the connection timer.
+        notificationBuilder = getNotificationBuilder(serverConfig);
+      }
+      final String statusStringResourceId = status == OutlinePlugin.ConnectionStatus.CONNECTED
+          ? "connected_server_state"
+          : "reconnecting_server_state";
+      notificationBuilder.setContentText(getStringResource(statusStringResourceId));
+      startForeground(NOTIFICATION_SERVICE_ID, notificationBuilder.build());
     } catch (Exception e) {
       LOG.warning("Unable to display persistent notification");
     }
   }
 
-  /* Removes a persistent notification from the notifications dropdown. */
-  private void removePersistentNotification() {
+  /* Returns a notification builder with the provided server configuration.  */
+  private Notification.Builder getNotificationBuilder(final JSONObject serverConfig)
+      throws Exception {
+    Intent launchIntent = new Intent(this, getPackageMainActivityClass());
+    PendingIntent mainActivityIntent =
+        PendingIntent.getActivity(this, 0, launchIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+
+    Notification.Builder builder;
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      NotificationChannel channel = new NotificationChannel(
+          NOTIFICATION_CHANNEL_ID, "Outline", NotificationManager.IMPORTANCE_LOW);
+      NotificationManager notificationManager = getSystemService(NotificationManager.class);
+      notificationManager.createNotificationChannel(channel);
+      builder = new Notification.Builder(this, NOTIFICATION_CHANNEL_ID);
+    } else {
+      builder = new Notification.Builder(this);
+    }
+    try {
+      builder.setSmallIcon(getResourceId("small_icon", "drawable"));
+    } catch (Exception e) {
+      LOG.warning("Failed to retrieve the resource ID for the notification icon.");
+    }
+    return builder.setContentTitle(getServerName(serverConfig))
+        .setColor(NOTIFICATION_COLOR)
+        .setVisibility(Notification.VISIBILITY_SECRET) // Don't display in lock screen
+        .setContentIntent(mainActivityIntent)
+        .setShowWhen(true)
+        .setUsesChronometer(true);
+  }
+
+  /* Stops the foreground service and removes the persistent notification. */
+  private void stopForeground() {
     stopForeground(true /* remove notification */);
+    notificationBuilder = null;
   }
 
   /* Retrieves the MainActivity class from the application package. */
@@ -511,25 +577,14 @@ public class VpnTunnelService extends VpnService {
     }
   }
 
-  /* Gets the resource id for the given drawable. Uses reflection to access the package's R
-   * class. */
-  private int getResourceIdForDrawable(final String drawable) throws Exception {
-    int resId = 0;
-    try {
-      Class<?> cls = Class.forName(getPackageName() + ".R$drawable");
-      resId = (Integer) cls.getDeclaredField(drawable).get(Integer.class);
-    } catch (Exception e) {
-      LOG.warning(
-          String.format(Locale.ROOT, "Failed to get resource id for drawable: %s", drawable));
-      throw e;
-    }
-    return resId;
+  /* Retrieves the ID for a resource. This is equivalent to using the generated R class. */
+  public int getResourceId(final String name, final String type) {
+    return getResources().getIdentifier(name, type, getPackageName());
   }
 
   /* Returns the server's name from |serverConfig|. If the name is not present, it falls back to the
    * host name (IP address), or the application name if neither can be retrieved. */
-  private final String getServerName(final JSONObject serverConfig)
-      throws PackageManager.NameNotFoundException {
+  private final String getServerName(final JSONObject serverConfig) {
     try {
       String serverName = serverConfig.getString("name");
       if (serverName == null || serverName.equals("")) {
@@ -539,7 +594,7 @@ public class VpnTunnelService extends VpnService {
     } catch (Exception e) {
       LOG.severe("Failed to get name property from server config.");
     }
-    return getApplicationName();
+    return getStringResource("server_default_name_outline");
   }
 
   /* Returns the application name. */
@@ -547,5 +602,16 @@ public class VpnTunnelService extends VpnService {
     PackageManager packageManager = getApplicationContext().getPackageManager();
     ApplicationInfo appInfo = packageManager.getApplicationInfo(getPackageName(), 0);
     return (String) packageManager.getApplicationLabel(appInfo);
+  }
+
+  /* Retrieves a localized string by id from the application's resources. */
+  private String getStringResource(final String name) {
+    String resource = "";
+    try {
+      resource = getString(getResourceId(name, "string"));
+    } catch (Exception e) {
+      LOG.warning(String.format(Locale.ROOT, "Failed to retrieve string resource: %s", name));
+    }
+    return resource;
   }
 }
